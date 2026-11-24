@@ -23,9 +23,17 @@
 #
 #   toda instruccion          2 ciclos (1 de espera del banco de
 #                                       registros + 1 de ejecucion)
+#   (el store escribe y el load lee el bus en el flanco final de su
+#    segundo ciclo)
 #   load                      3 ciclos (uno mas: la RAM es sincrona)
 #   salto o branch tomado     3 ciclos (uno mas: se descarta la
 #                                       instruccion ya buscada)
+#
+# Tambien modela los aceleradores del Proyecto 4 (rtl/pochoco_mul.v y
+# rtl/pochoco_div.v, en 0x8002_0000). El resultado se calcula al
+# arrancar, pero leerlo antes de que el hardware termine (9 flancos
+# despues de arrancar el multiplicador, 25 el divisor) es un error: asi
+# se comprueba que los nop de trade_mul.s y trade_div.s alcanzan.
 #
 # No reemplaza al testbench en Verilog: es la herramienta para medir y
 # comparar rapido. El numero oficial de ciclos es el de tb_proyecto_4.
@@ -40,6 +48,14 @@ import trader  # noqa: E402
 M32 = 0xFFFFFFFF
 SPI_BASE = 0x80010000
 PER_BASE = 0x80000000
+ACEL_BASE = 0x80020000
+
+# Flancos entre la escritura que arranca un acelerador y el primer
+# flanco de lectura que ve el resultado final (ver tools/../rtl)
+LAT_MUL = 9
+LAT_DIV = 25
+PASOS_MUL = 8
+PASOS_DIV = 24
 
 
 def s32(x):
@@ -73,10 +89,32 @@ class Espino:
         self.escribio = False
         self.leds = 0
         self.display = 0
-        self.cuenta_pc = {}
+        self.cuenta_pc = {}      # pc -> ciclos
+        self.ic_pc = {}          # pc -> instrucciones
+        self.ops_pc = {}         # pc -> operaciones aritmeticas (core + acelerador)
+        self.bytes_pc = {}       # pc -> bytes leidos o escritos en el bus de datos
+        # aceleradores
+        self.mul_a = self.mul_r = 0
+        self.div_n = self.div_q = self.div_r = 0
+        self.mul_flanco = self.div_flanco = None
+        self.flanco = 0          # flanco en que la instruccion actual usa el bus
 
     # --- bus de datos ------------------------------------------------
     def leer(self, addr):
+        if addr & 0x80000000 and addr & 0x20000:
+            off = addr & 0x1C
+            if off == 0x08:
+                self.revisar(self.mul_flanco, LAT_MUL, "multiplicador")
+                return self.mul_r
+            if off == 0x0C:
+                return 0 if self.mul_flanco is None else max(0, PASOS_MUL - (self.flanco - self.mul_flanco - 1))
+            if off == 0x18:
+                self.revisar(self.div_flanco, LAT_DIV, "divisor")
+                return self.div_q
+            if off == 0x1C:
+                self.revisar(self.div_flanco, LAT_DIV, "divisor")
+                return self.div_r
+            return 0
         if addr & 0x80000000:
             if addr & 0x10000:
                 off = addr & 0xFC
@@ -89,7 +127,31 @@ class Espino:
             return 0
         return self.mem[(addr >> 2) % len(self.mem)]
 
+    def revisar(self, inicio, latencia, nombre):
+        if inicio is None or self.flanco - inicio < latencia:
+            raise RuntimeError("pc=%x: lee el %s %s flancos despues de arrancarlo (necesita %d)"
+                               % (self.pc, nombre, "?" if inicio is None else self.flanco - inicio, latencia))
+
     def escribir(self, addr, valor):
+        if addr & 0x80000000 and addr & 0x20000:
+            off = addr & 0x1C
+            valor &= M32
+            if off == 0x00:
+                self.mul_a = valor
+            elif off == 0x04:
+                self.mul_r = (self.mul_a * (valor & 0xFF)) & M32
+                self.mul_flanco = self.flanco
+                self.ops_pc[self.pc] = self.ops_pc.get(self.pc, 0) + PASOS_MUL
+            elif off == 0x10:
+                self.div_n = valor
+            elif off == 0x14:
+                if valor == 0 or self.div_n >= (valor << 24) or valor >= (1 << 31):
+                    raise RuntimeError("pc=%x: division fuera del rango del divisor (%d / %d)"
+                                       % (self.pc, self.div_n, valor))
+                self.div_q, self.div_r = divmod(self.div_n, valor)
+                self.div_flanco = self.flanco
+                self.ops_pc[self.pc] = self.ops_pc.get(self.pc, 0) + PASOS_DIV
+            return
         if addr & 0x80000000:
             if addr & 0x10000:
                 if addr & 0xFC == 8:
@@ -120,6 +182,8 @@ class Espino:
         sig = pc + 4
         ciclos = 2
         res = None
+        self.flanco = self.ciclos + 2        # segundo ciclo de la instruccion
+        bus = 0
 
         if op == 0x37:                                   # lui
             res = ins & 0xFFFFF000
@@ -145,11 +209,13 @@ class Espino:
                 raise RuntimeError("load no soportado por el simulador en pc=%x" % pc)
             res = self.leer((a + imm_i) & M32)
             ciclos = 3
+            bus = 4
         elif op == 0x23:                                 # store
             if f3 != 2:
                 raise RuntimeError("store no soportado por el simulador en pc=%x" % pc)
             imm = sx(((ins >> 25) << 5) | ((ins >> 7) & 0x1F), 12)
             self.escribir((a + imm) & M32, b)
+            bus = 4
         elif op in (0x13, 0x33):                         # aritmetica
             o2 = b if op == 0x33 else imm_i & M32
             if f3 == 0:
@@ -169,6 +235,11 @@ class Espino:
         else:
             raise RuntimeError("instruccion ilegal %08x en pc=%x" % (ins, pc))
 
+        if op in (0x13, 0x33) and rd != 0:
+            self.ops_pc[pc] = self.ops_pc.get(pc, 0) + 1
+        if bus:
+            self.bytes_pc[pc] = self.bytes_pc.get(pc, 0) + bus
+        self.ic_pc[pc] = self.ic_pc.get(pc, 0) + 1
         if res is not None and rd != 0:
             self.x[rd] = res & M32
         self.pc = sig & M32
@@ -261,23 +332,48 @@ def main():
     if a.perfil is not None:
         fuente = a.perfil or a.hex.replace(".hex", ".s")
         etiquetas = etiquetas_de(fuente)
-        grupos = {}
-        for pc, c in cpu.cuenta_pc.items():
+        def nombre_de(pc):
             nombre = "inicio"
             for dir_, et in etiquetas:
                 if dir_ <= pc:
                     nombre = et
                 else:
                     break
-            g = grupo(nombre)
-            grupos[g] = grupos.get(g, 0) + c
-        total = sum(grupos.values())
+            return grupo(nombre)
+
+        grupos = {}
+        for pc in cpu.ic_pc:
+            g = grupos.setdefault(nombre_de(pc), dict(ciclos=0, ic=0, ops=0, bytes=0, llamadas=0))
+            g["ciclos"] += cpu.cuenta_pc.get(pc, 0)
+            g["ic"] += cpu.ic_pc.get(pc, 0)
+            g["ops"] += cpu.ops_pc.get(pc, 0)
+            g["bytes"] += cpu.bytes_pc.get(pc, 0)
+        for et in ("multiplicar", "dividir"):
+            pc = dict((e, d) for d, e in etiquetas).get(et)
+            if pc is not None and et in grupos:
+                grupos[et]["llamadas"] = cpu.ic_pc.get(pc, 0)
+        grupos.pop("esperar", None)
+        total = sum(g["ciclos"] for g in grupos.values())
         print()
         print("Ciclos por parte del programa (toda la corrida, sin contar la espera):")
-        espera = grupos.pop("esperar", 0)
-        total -= espera
-        for g, c in sorted(grupos.items(), key=lambda kv: -kv[1]):
-            print("  %-12s %10d  %5.1f %%" % (g, c, 100.0 * c / total))
+        for g, d in sorted(grupos.items(), key=lambda kv: -kv[1]["ciclos"]):
+            print("  %-12s %10d  %5.1f %%" % (g, d["ciclos"], 100.0 * d["ciclos"] / total))
+        print("  %-12s %10d" % ("total", total))
+        print()
+        print("Kernels (op = instruccion aritmetica del core o paso de un acelerador;")
+        print("bytes = lw y sw, incluidos los registros MMIO; rendimiento a 25 MHz):")
+        print("  %-12s %9s %12s %8s %9s %8s %10s %12s"
+              % ("", "llamadas", "ciclos/llam", "CPI", "ops/llam", "B/llam", "ops/byte", "Mops/s"))
+        for g in ("multiplicar", "dividir"):
+            d = grupos.get(g)
+            if not d or not d["llamadas"]:
+                continue
+            n = d["llamadas"]
+            ai = d["ops"] / d["bytes"] if d["bytes"] else float("inf")
+            print("  %-12s %9d %12.1f %8.2f %9.1f %8.1f %10s %12.2f"
+                  % (g, n, d["ciclos"] / n, d["ciclos"] / d["ic"], d["ops"] / n, d["bytes"] / n,
+                     "infinito" if ai == float("inf") else "%.2f" % ai,
+                     d["ops"] / (d["ciclos"] / 25e6) / 1e6))
     return 1 if distintos or not ok_estado else 0
 
 

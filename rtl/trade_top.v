@@ -6,9 +6,19 @@
 // competencia. No agrega logica propia: instancia el Pochoco SoC con
 // la imagen de memoria del agente (sw/trade.hex) y conecta los pines
 // de la Go Board. Los pines del SPI (PMOD) van a la FPGA maestra.
+//
+// Variantes de hardware (seccion 5 del informe): Acelerador elige los
+// perifericos MMIO, y MemFile tiene que ser el programa que los usa:
+//   Acelerador 0  sw/trade.hex            solo software (version final)
+//   Acelerador 1  build/trade_mul.hex     multiplicador
+//   Acelerador 2  build/trade_div.hex     divisor
+//   Acelerador 3  build/trade_muldiv.hex  ambos
+// tools/sintesis.sh las sintetiza todas.
 
 module trade_top #(
-  parameter MemFile = "sw/trade.hex"
+  parameter MemFile    = "sw/trade.hex",
+  parameter Acelerador = 0,    // 0 software, 1 mul, 2 div, 3 ambos (ver pochoco_soc.v)
+  parameter Contador   = 0     // el agente no usa el contador de ciclos del P2
 ) (
   input  wire       i_Clk,
 
@@ -27,7 +37,9 @@ module trade_top #(
 );
 
   pochoco_soc #(
-    .MemFile (MemFile)
+    .MemFile    (MemFile),
+    .Acelerador (Acelerador),
+    .Contador   (Contador)
   ) u_pochoco (
     .i_Clk        (i_Clk),
 

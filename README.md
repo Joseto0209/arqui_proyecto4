@@ -25,8 +25,8 @@ programa se traduce a código máquina con el **ensamblador del grupo**
 | Algoritmo y versión de referencia (`ref/trader.py`) | Listo |
 | Agente en assembly (`sw/trade.s`) | Listo; mismas decisiones que la referencia en los 20 000 ticks |
 | Mediciones por tick: IC, ciclos, CPI y tiempo | Listo (simulador de instrucciones) |
-| Testbench del curso (`tb/tb_proyecto_4.sv`) | Compila y corre con `make sim-p4` |
-| Alternativas de hardware (LUTs, frecuencia, Ops/s, roofline) | Pendiente |
+| Testbench del curso (`tb/tb_proyecto_4.sv`) | 4/4 chequeos; patrimonio 21 906; peor caso 787 ciclos |
+| Alternativas de hardware: multiplicador y divisor MMIO | `make tb-acel` 14/14, `make sim-hw VAR=muldiv` 4/4; el multiplicador cabe en la FPGA, el divisor no |
 | Informe | Pendiente |
 
 ---
@@ -41,17 +41,27 @@ sw/
   trade.hex                el agente ensamblado (lo que carga la RAM)
   trade_v0.s               el mismo agente con multiplicacion y division ingenuas
                            (linea base de las mediciones)
+  trade_mul.s, trade_div.s, trade_muldiv.s
+                           variantes que usan los aceleradores (generadas por
+                           tools/variantes.py, no se editan a mano)
 tools/
   espino_iss.py            simulador de instrucciones del Espino: compara con la
                            referencia y mide IC, ciclos y CPI por tick
   comparar.py              compara el decisiones.csv del testbench con la referencia
+  variantes.py             genera las variantes de hardware de sw/trade.s
+  sintesis.sh              sintetiza las 4 variantes: LUTs, celdas, BRAM y Fmax
 tb/
   tb_proyecto_4.sv         testbench del curso (emula a la FPGA maestra)
+  tb_proyecto_4_hw.sv      el mismo, con el SoC de una variante de hardware
+  tb_acel.v                testbench de los aceleradores
   practica_meta.csv        serie de practica: 20 000 ticks, precios entre 100 y 255
   sb_ram40_4k.v            modelo de la RAM de la iCE40, solo para simular
 rtl/
   trade_top.v              top del proyecto (lo que se sintetiza), con sw/trade.hex
-  pochoco_soc.v            SoC: Espino + RAM + perifericos + SPI
+  pochoco_mul.v            acelerador: multiplicador 32 x 8 secuencial (MMIO)
+  pochoco_div.v            acelerador: divisor de 24 bits secuencial (MMIO)
+  pochoco_soc.v            SoC: Espino + RAM + perifericos + SPI + aceleradores
+                           (parametro Acelerador: 0 ninguno, 1 mul, 2 div, 3 ambos)
   pochoco_spi_slave.v      esclavo SPI: registros STATUS, PRICE y DECISION
   pochoco_periph.v         LEDs, botones, displays y contador de ciclos
   pochoco_ram.v
@@ -112,10 +122,10 @@ de la placa con Zadig, igual que en el Proyecto 2 (`docs/proyecto2/README.md`).
 
 | Herramienta | Versión usada |
 |---|---|
-| Python | *completar con `python3 --version`* |
-| Yosys | *completar con `yosys -V`* |
-| nextpnr-ice40 | *completar con `nextpnr-ice40 --version`* |
-| Icarus Verilog | *completar con `iverilog -V`* |
+| Python | 3.15.0 |
+| Yosys | 0.67+post (git `22c15a7`, paquete de Fedora 45) |
+| nextpnr-ice40 | paquete de Fedora `nextpnr-1-69.20260601git3a3b273` |
+| Icarus Verilog | *completar con `iverilog -V`* (viene en OSS CAD Suite) |
 
 ---
 
@@ -130,6 +140,12 @@ Todos desde la raíz del repositorio.
 | Decisiones, IC, ciclos y CPI por tick | `make iss` | `python tools\espino_iss.py sw\trade.hex tb\practica_meta.csv --perfil` |
 | Testbench del curso | `make sim-p4` | `sim_p4` |
 | Sintetizar y grabar la placa | `make prog-trade` | `build_trade` |
+| Generar las variantes de hardware | `make variantes` | — |
+| Mediciones de las 5 versiones | `make iss-hw` | — |
+| Testbench de los aceleradores | `make tb-acel` | — |
+| Testbench del curso con una variante | `make sim-hw VAR=mul` (o `div`, `muldiv`) | — |
+| LUTs, celdas, BRAM y Fmax de las variantes | `make recursos` | — |
+| Grabar una variante | `make prog-trade PROG=muldiv` | — |
 
 - `make trade` escribe `sw/trade.hex` y el listado `build/trade.lst`.
 - `make ref` imprime la tabla de resultados y escribe `build/ref_decisiones.csv`.
@@ -138,6 +154,11 @@ Todos desde la raíz del repositorio.
   `decisiones.csv` con la referencia. Con los 20 000 ticks tarda varios minutos.
   El período y la cantidad de ticks se cambian arriba en `tb/tb_proyecto_4.sv`
   (`PERIODO_NS` y `NTICKS`).
+
+- `make sim-hw` usa 2 000 ticks para que tarde pocos minutos; `TICKS=20000`
+  corre la serie completa. Como la referencia tiene 20 000 ticks, la
+  comparación avisa que compara solo los primeros.
+- `make recursos` escribe la tabla en `build/recursos.txt`.
 
 El aviso `$readmemh ... Not enough words in the file` es inofensivo: el programa
 ocupa menos que las 512 palabras de la RAM.
@@ -231,9 +252,56 @@ Las dos versiones entregan el mismo byte que `ref/trader.py` en los 20 000 ticks
 
 ---
 
-## 5. En la competencia
+## 5. Co-diseño hardware/software
 
-1. Grabar la placa con `make prog-trade` (o `build_trade` en Windows).
+Multiplicar y dividir se llevan el 79 % de los ciclos de `trade.s`. Se
+llevaron a hardware como dos periféricos MMIO en `0x8002_0000`, que hacen la
+misma "suma y duplica" y la división con restauración del software, pero un
+paso por ciclo de reloj.
+
+| Periférico | Registros | Pasos | El programa espera |
+|---|---|---|---|
+| `pochoco_mul.v` | `A` 0x00, `B` 0x04 (arranca), `R` 0x08, estado 0x0C | 8 | 4 `nop` entre el `sw` de B y el `lw` de R |
+| `pochoco_div.v` | `N` 0x10, `D` 0x14 (arranca), `Q` 0x18, resto 0x1C | 24 | 12 `nop` entre el `sw` de D y el `lw` de Q |
+
+La espera es fija: el Espino no tiene estados de espera en el bus, y cada
+instrucción dura 2 ciclos. `tb/tb_acel.v` comprueba que con un `nop` menos el
+resultado sale incompleto, y el simulador de instrucciones falla si el programa
+lee antes de tiempo.
+
+Mediciones con el simulador de instrucciones, serie de práctica completa. Las
+cinco versiones toman las mismas 20 000 decisiones.
+
+| Versión | Ciclos prom. | Ciclos peor | Ronda 3 | Speedup total (Amdahl / medido) |
+|---|---|---|---|---|
+| `trade_v0.s` (ingenua) | 2 288,5 | 5 669 | 250,6 % | — |
+| `trade.s` (software, final) | 311,3 | 788 | 34,8 % | 7,6 / 7,56 sobre v0 |
+| `trade_mul.s` + multiplicador | 221,2 | 613 | 27,1 % | 1,43 / 1,43 sobre `trade.s` |
+| `trade_div.s` + divisor | 230,8 | 450 | 19,9 % | 1,36 / 1,36 sobre `trade.s` |
+| `trade_muldiv.s` + ambos | 140,7 | 275 | 12,2 % | 2,30 / 2,31 sobre `trade.s` |
+
+En el testbench del curso, la variante con ambos aceleradores da 4/4 y un peor
+caso de 271 ciclos (2 000 ticks, decisiones iguales a la referencia).
+
+Recursos (`make recursos`, sin el contador del Proyecto 2, nextpnr a 25 MHz):
+
+| Variante | SB_LUT4 | Celdas lógicas (de 1 280) | SB_RAM40_4K | Fmax |
+|---|---|---|---|---|
+| Software (`trade.s`) | 923 | 1 090 (85 %) | 12 | 44,61 MHz |
+| Multiplicador | 1 056 | 1 252 (98 %) | 12 | 44,95 MHz |
+| Divisor | 1 115 | 1 339: no cabe | 12 | no rutea |
+| Ambos | 1 260 | 1 492: no cabe | 12 | no rutea |
+
+**Versión final: `trade.s`, solo software.** Todas toman las mismas decisiones,
+así que el hardware no cambia el patrimonio; `trade.s` cumple la ronda 3 con el
+65 % del presupuesto libre y deja 190 celdas libres.
+
+---
+
+## 6. En la competencia
+
+1. Grabar la placa con `make prog-trade` (o `build_trade` en Windows). Graba la
+   versión de solo software, que es la final.
 2. Conectar el PMOD a la FPGA maestra, compartiendo tierra.
 3. **Antes de cada ronda, apretar un botón de la placa:** reinicia la caja
    propia (10 000) y las acciones (0), igual que la maestra.
@@ -249,4 +317,5 @@ LED 0: ya vio el mínimo. LED 1: ya vio el máximo.
   ([pochoco_soc](https://github.com/nic0villegasc/pochoco_soc)), bajo la licencia
   Solderpad Hardware License 0.51. Se conservan sus avisos de copyright.
 - Testbench `tb/tb_proyecto_4.sv` y serie de práctica: entregados por el curso.
-- Agente, referencia, simulador de instrucciones, ensamblador y pruebas: el grupo.
+- Agente, referencia, simulador de instrucciones, aceleradores, ensamblador y
+  pruebas: el grupo.

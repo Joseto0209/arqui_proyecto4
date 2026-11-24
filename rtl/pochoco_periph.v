@@ -8,7 +8,9 @@
 // Authors:
 // - Nicolás Villegas <navillegas@miuandes.cl>
 
-module pochoco_periph (
+module pochoco_periph #(
+  parameter Contador = 1    // 0: sin contador de ciclos (Proyecto 4, ahorra celdas)
+) (
   input  wire        clk_i,
   input  wire        rst_ni,
   input  wire        sel_i,
@@ -62,12 +64,23 @@ module pochoco_periph (
   // correcto aunque el contador haya dado la vuelta entre ambas
   // lecturas, siempre que el intervalo sea menor a 171,8 s.
   // ------------------------------------------------------------------
-  reg [31:0] cycle_q;
+  //
+  // Proyecto 4: con Contador = 0 no se genera (el agente no lo usa) y
+  // el offset 0x0C se lee como 0.
+  wire [31:0] cycle_q;
 
-  always @(posedge clk_i or negedge rst_ni) begin
-    if (!rst_ni) cycle_q <= 32'b0;
-    else         cycle_q <= cycle_q + 32'd1;
-  end
+  generate
+    if (Contador != 0) begin : g_contador
+      reg [31:0] cuenta_q;
+      always @(posedge clk_i or negedge rst_ni) begin
+        if (!rst_ni) cuenta_q <= 32'b0;
+        else         cuenta_q <= cuenta_q + 32'd1;
+      end
+      assign cycle_q = cuenta_q;
+    end else begin : g_sin_contador
+      assign cycle_q = 32'b0;
+    end
+  endgenerate
 
   // Hex to 7-segment decoder function
   function [6:0] hex2seg;
