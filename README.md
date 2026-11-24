@@ -123,9 +123,9 @@ de la placa con Zadig, igual que en el Proyecto 2 (`docs/proyecto2/README.md`).
 | Herramienta | Versión usada |
 |---|---|
 | Python | 3.15.0 |
-| Yosys | 0.67+post (git `22c15a7`, paquete de Fedora 45) |
-| nextpnr-ice40 | paquete de Fedora `nextpnr-1-69.20260601git3a3b273` |
-| Icarus Verilog | *completar con `iverilog -V`* (viene en OSS CAD Suite) |
+| Yosys | 0.71+101 (git `c20ecc62a`), de OSS CAD Suite |
+| nextpnr-ice40 | nextpnr-0.11.1-123-ge4c78599, de OSS CAD Suite |
+| Icarus Verilog | 14.0 (devel), `s20260301-1285-g231fb9245`, de OSS CAD Suite |
 
 ---
 
